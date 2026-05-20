@@ -1,111 +1,188 @@
-import streamlit as st
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+import joblib
 import numpy as np
-import soundfile as sf
-from scipy.io import wavfile
+from scipy.signal import welch
+from scipy.stats import skew, kurtosis
+import mne
+import tempfile
 
-from filters import (
-    low_pass_filter,
-    high_pass_filter,
-    band_pass_filter
+# ============================================================
+# CREATE FASTAPI APP
+# ============================================================
+
+app = FastAPI()
+
+# ============================================================
+# ENABLE CORS
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# PAGE SETTINGS
-st.set_page_config(
-    page_title="Audio Equalizer",
-    layout="centered"
-)
+# ============================================================
+# LOAD MODEL AND SCALER
+# ============================================================
 
-# TITLE
-st.title("🎵 Audio Equalizer")
+model = joblib.load("sleep_model.pkl")
+scaler = joblib.load("scaler.pkl")
 
-st.write("Upload WAV audio and apply filters")
+# ============================================================
+# SLEEP LABELS
+# ============================================================
 
-# FILE UPLOADER
-uploaded_file = st.file_uploader(
-    "Upload WAV File",
-    type=["wav"]
-)
+sleep_labels = {
+    0: 'Wake',
+    1: 'N1',
+    2: 'N2',
+    3: 'Deep',
+    4: 'REM'
+}
 
-# IF FILE EXISTS
-if uploaded_file is not None:
+# ============================================================
+# HOME ROUTE
+# ============================================================
 
-    # READ AUDIO FILE
-    sample_rate, audio_data = wavfile.read(uploaded_file)
+@app.get("/")
+def home():
+    return {
+        "message": "Sleep Detection API Running Successfully"
+    }
 
-    st.success("Audio Uploaded Successfully")
+# ============================================================
+# PREDICTION ROUTE
+# ============================================================
 
-    # PLAY ORIGINAL AUDIO
-    st.audio(uploaded_file)
+@app.post("/predict")
+async def predict_sleep(file: UploadFile = File(...)):
 
-    # FILTER SELECTION
-    filter_type = st.selectbox(
-        "Select Filter",
-        ["Low Pass", "High Pass", "Band Pass"]
-    )
+    try:
 
-    # FREQUENCY SLIDER
-    cutoff = st.slider(
-        "Cutoff Frequency",
-        min_value=100,
-        max_value=10000,
-        value=2000
-    )
+        # Save uploaded EDF file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp:
 
-    # APPLY FILTER BUTTON
-    if st.button("Apply Filter"):
+            tmp.write(await file.read())
 
-        # LOW PASS
-        if filter_type == "Low Pass":
+            temp_path = tmp.name
 
-            filtered_audio = low_pass_filter(
-                audio_data,
-                cutoff,
-                sample_rate
-            )
+        # ====================================================
+        # LOAD EDF FILE
+        # ====================================================
 
-        # HIGH PASS
-        elif filter_type == "High Pass":
-
-            filtered_audio = high_pass_filter(
-                audio_data,
-                cutoff,
-                sample_rate
-            )
-
-        # BAND PASS
-        else:
-
-            filtered_audio = band_pass_filter(
-                audio_data,
-                300,
-                cutoff,
-                sample_rate
-            )
-
-        # CONVERT TO INT16
-        filtered_audio = np.int16(filtered_audio)
-
-        # OUTPUT FILE
-        output_file = "output.wav"
-
-        # SAVE OUTPUT
-        sf.write(
-            output_file,
-            filtered_audio,
-            sample_rate
+        raw = mne.io.read_raw_edf(
+            temp_path,
+            preload=True,
+            verbose=False
         )
 
-        st.success("Filter Applied Successfully")
+        # ====================================================
+        # FILTER EEG SIGNAL
+        # ====================================================
 
-        # PLAY FILTERED AUDIO
-        st.audio(output_file)
+        raw.filter(
+            0.5,
+            30,
+            verbose=False
+        )
 
-        # DOWNLOAD BUTTON
-        with open(output_file, "rb") as file:
+        # ====================================================
+        # EXTRACT FIRST EEG CHANNEL
+        # ====================================================
 
-            st.download_button(
-                label="Download Filtered Audio",
-                data=file,
-                file_name="filtered_audio.wav",
-                mime="audio/wav"
-            )
+        signal = raw.get_data()[0]
+
+        # ====================================================
+        # FEATURE EXTRACTION
+        # ====================================================
+
+        freqs, psd = welch(
+            signal,
+            fs=raw.info['sfreq']
+        )
+
+        delta = np.mean(
+            psd[(freqs >= 0.5) & (freqs < 4)]
+        )
+
+        theta = np.mean(
+            psd[(freqs >= 4) & (freqs < 8)]
+        )
+
+        alpha = np.mean(
+            psd[(freqs >= 8) & (freqs < 13)]
+        )
+
+        beta = np.mean(
+            psd[(freqs >= 13) & (freqs < 30)]
+        )
+
+        features = [[
+
+            np.mean(signal),
+
+            np.std(signal),
+
+            np.var(signal),
+
+            skew(signal),
+
+            kurtosis(signal),
+
+            delta,
+
+            theta,
+
+            alpha,
+
+            beta
+        ]]
+
+        # ====================================================
+        # SCALE FEATURES
+        # ====================================================
+
+        X_scaled = scaler.transform(features)
+
+        # ====================================================
+        # PREDICT SLEEP STAGE
+        # ====================================================
+
+        prediction = model.predict(X_scaled)[0]
+
+        result = sleep_labels.get(
+            int(prediction),
+            "Unknown"
+        )
+
+        # ====================================================
+        # RETURN RESULT
+        # ====================================================
+
+        return {
+            "predicted_stage": result
+        }
+
+    except Exception as e:
+
+        return {
+            "error": str(e)
+        }
+
+# ============================================================
+# RUN SERVER LOCALLY
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=10000
+    )
